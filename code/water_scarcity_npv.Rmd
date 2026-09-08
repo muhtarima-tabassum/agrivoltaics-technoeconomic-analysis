@@ -1,0 +1,1311 @@
+---
+title: "water_scarcity-NPV"
+author: "Muhtarima Tabassum"
+date: "2026-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## ======================================================================
+## ONE-FILE SCRIPT (DISCOUNTED CASH FLOW / NPV, CONSTANT 2025 DOLLARS)
+## Water-scarcity scenario (NO water saving):
+## - AgOnly effective agricultural area = 80% of total acres
+## - AV effective agricultural area = 100% of total acres, EXCEPT solar structure land-loss alpha
+## - Water-saving factor δ is set to 0 (no irrigation savings in AV)
+## - Sensitivity EXCLUDES water-saving factor; includes effective land parameters instead
+## ======================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2)
+  library(scales); library(purrr); library(stringr); library(tibble)
+})
+
+## ---- 0) GLOBALS -------------------------------------------------------
+years <- 25
+total_acres <- 10
+
+## Discount rate (REAL because CF is constant 2025$)
+discount_rate <- 0.03
+
+## PV sizing & costs (AC basis)
+system_kw_ac <- 818
+capex_per_kw <- 1678
+
+## PV economics
+P_elec               <- 0.07
+solar_om_cost_per_kw <- 23.60
+salvage_rate <- 0.10
+
+## 5-year MACRS (half-year convention)
+macrs_pv <- c(0.20,0.32,0.192,0.1152,0.1152,0.0576)
+
+## Taxes
+federal_tax_rate  <- 0.21
+state_tax_rate    <- 0.0884
+combined_tax_rate <- federal_tax_rate + state_tax_rate * (1 - federal_tax_rate)
+
+## Land & AV layout
+alpha <- 0.10
+land_rent_per_acre <- 0
+annual_land_rent   <- land_rent_per_acre * total_acres
+
+## Loan & inverter
+loan_term                 <- 15
+interest_rate             <- 0.05
+inverter_replacement_year <- 15
+## Inverter replacement cost ($/kW-AC)
+inverter_replacement_cost_per_kw <- 70.87
+
+## ITC sale settings (if policy sells ITC in Year 1)
+itc_sale_price <- 0.90
+
+## Site kWh (Year 1)
+G_solar_base <- c(
+  El_Centro=1987900.40, Mecca=2017947.10, Bakersfield=1821452.40,
+  Modesto=1751131.00, Fresno=1751000.00, Chico=1762015.40,
+  Oxnard=1770692.40, Salinas=1747830.00, Davis=1783881.50
+)
+site_for_plots <- "Davis"
+
+## Ag machinery MACRS (7-yr)
+macrs_ag <- c(0.1429, 0.2449, 0.1749, 0.1249, 0.0893, 0.0892, 0.0893, 0.0446)
+
+## ---- Water scarcity effective land assumptions ------------------------
+eff_land_ag <- 0.80  # AgOnly effective agricultural area
+eff_land_av <- 1.00  # AV effective agricultural area (then reduced by alpha for structure)
+```
+
+```{r}
+## ---- 1) CROP DATA -----------------------------------------------------
+capital_investment_per_acre <- c(
+  Bell_Peppers=1179.32, Lima_beans=4411.36, Corn=4276.57, Strawberry=21888.06,
+  Wheat=14676.43, Spinach=12546.07, Garbanzo=10690.60, Tomato=1473,
+  Lettuce_Romaine=13720.90, Lettuce_Iceberg=13720.90, CoverCrop=0,
+  Potato=8664.31, Onion=10305.17, Broccoli=6132.77,
+  Raspberries_Y1=13807.58, Raspberries_Y2=0, Raspberries_Y3=0
+)
+
+salvage_value_per_acre <- c(
+  Bell_Peppers=257.23, Lima_beans=896.44, Corn=744.78, Strawberry=4116.59,
+  Wheat=6324.10, Spinach=4645.67, Garbanzo=1495.27, Tomato=142.54,
+  Lettuce_Romaine=4728.81, Lettuce_Iceberg=4728.81, CoverCrop=0,
+  Potato=4492.68, Onion=4602.67, Broccoli=2580.51,
+  Raspberries_Y1=3946.57, Raspberries_Y2=0, Raspberries_Y3=0
+)
+
+yield <- c(
+  Bell_Peppers=30, Lima_beans=1.4, Corn=6, Strawberry=36, Wheat=3.5, Spinach=3.25,
+  Garbanzo=1.325, Tomato=46, Lettuce_Romaine=9.35, Lettuce_Iceberg=18.9,
+  CoverCrop=0, Hay=7, Potato=26.75, Onion=23.25, Broccoli=7.35,
+  Raspberries_Y1=10.6875, Raspberries_Y2=17.1, Raspberries_Y3=10.6875
+)
+
+price <- c(
+  Bell_Peppers=393.58, Lima_beans=1585.17, Corn=311.33, Strawberry=3620.08,
+  Wheat=369.19, Spinach=2977.97, Garbanzo=1307.54, Tomato=145.20,
+  Lettuce_Romaine=1056.78, Lettuce_Iceberg=2305.89, CoverCrop=0,
+  Potato=237.78, Onion=264.19, Broccoli=1710.98,
+  Raspberries_Y1=8923.91, Raspberries_Y2=8923.91, Raspberries_Y3=8923.91
+)
+
+total_cost <- c(
+  Bell_Peppers=6284, Lima_beans=1240.76, Corn=1437.55, Strawberry=111426.17,
+  Wheat=890.09, Spinach=7950.65, Garbanzo=1140.64, Tomato=4554.41,
+  Lettuce_Romaine=15286.32, Lettuce_Iceberg=15689.48, CoverCrop=146.46,
+  Potato=3134.84, Onion=3591.65, Broccoli=11823.25,
+  Raspberries_Y1=80811.93, Raspberries_Y2=122603.34, Raspberries_Y3=75900.03
+)
+
+irrig_cost <- c(
+  Bell_Peppers=358.44, Lima_beans=264.09, Corn=227.41, Strawberry=853.31,
+  Wheat=60.41, Spinach=214.41, Garbanzo=116.91, Tomato=289.35,
+  Lettuce_Romaine=298.01, Lettuce_Iceberg=322.85, CoverCrop=23.64,
+  Potato=259.97, Onion=436.11, Broccoli=459.70,
+  Raspberries_Y1=546.36, Raspberries_Y2=546.36, Raspberries_Y3=546.36
+)
+
+## Water saving factor δ (NO water saving in this scenario => set to 0)
+water_saving <- setNames(rep(0.00, length(yield)), names(yield))
+
+## Ensure "Fallow" exists everywhere
+for (nm in c("capital_investment_per_acre","salvage_value_per_acre","yield","price",
+             "total_cost","irrig_cost","water_saving")) {
+  v <- get(nm)
+  if (!"Fallow" %in% names(v)) v["Fallow"] <- 0
+  assign(nm, v)
+}
+```
+
+```{r}
+## ---- 2) ROTATIONS -----------------------------------------------------
+make_rotation <- function(summer_vec, winter_vec = c("Fallow","Fallow"), n_years = years) {
+  tibble(
+    Year   = 1:n_years,
+    Summer = rep(summer_vec, length.out = n_years),
+    Winter = rep(winter_vec, length.out = n_years)
+  ) %>%
+    mutate(Summer = str_trim(Summer), Winter = str_trim(Winter))
+}
+
+rot_TGC <- make_rotation(c("Tomato","Garbanzo","Corn"))
+rot_BGC <- make_rotation(c("Bell_Peppers","Garbanzo","Corn"))
+
+lam_base_TGC <- -0.30
+lam_base_BGC <-  0.03
+```
+
+```{r}
+## ---- 3) NOL helper ----------------------------------------------------
+apply_nol_80 <- function(taxable_income_pre_nol, nol_cf_start) {
+  TI_pre  <- taxable_income_pre_nol
+  nol_beg <- nol_cf_start
+
+  if (TI_pre > 0) {
+    max_offset <- 0.80 * TI_pre
+    nol_used   <- min(nol_beg, max_offset)
+    TI_post    <- TI_pre - nol_used
+    nol_end    <- nol_beg - nol_used
+  } else {
+    nol_used <- 0
+    TI_post  <- TI_pre
+    nol_end  <- nol_beg + (-TI_pre)
+  }
+
+  list(TI_post = TI_post, NOL_used = nol_used, NOL_end = nol_end)
+}
+```
+
+```{r}
+## ---- 4) Policy table --------------------------------------------------
+policy_tbl <- tibble(
+  Policy = c("MACRS",
+             "MACRS+NOL",
+             "MACRS+ITC",
+             "MACRS+NOL+ITC",
+             "MACRS+NOL+ITC sold Y1",
+             "Bonus 100% (Y1 only, NO MACRS)",
+             "Bonus 100%+NOL"),
+  itc_rate      = c(0.00, 0.00, 0.30, 0.30, 0.30, 0.00, 0.00),
+  use_nol       = c(FALSE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE),
+  sell_itc      = c(FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE),
+  pv_dep_method = c("macrs","macrs","macrs","macrs","macrs","bonus100","bonus100")
+)
+```
+
+```{r}
+## ---- 5) AV engine (equity CF, constant 2025$) -------------------------
+av_table_policy <- function(lam_override,
+                            rotation,
+                            policy = "MACRS+NOL",
+                            site   = "Davis",
+                            ## scenario values for clean sensitivity
+                            P_elec_in               = P_elec,
+                            capex_per_kw_in         = capex_per_kw,
+                            solar_om_cost_per_kw_in = solar_om_cost_per_kw,
+                            interest_rate_in        = interest_rate,
+                            salvage_rate_in         = salvage_rate,
+                            alpha_in                = alpha,
+                            water_saving_in         = water_saving,
+                            discount_rate_in        = discount_rate,
+                            eff_land_av_in          = eff_land_av) {
+
+  stopifnot(site %in% names(G_solar_base))
+  stopifnot(policy %in% policy_tbl$Policy)
+
+  pol <- policy_tbl %>% filter(Policy == policy) %>% slice(1)
+
+  itc_rate_local <- pol$itc_rate[[1]]
+  use_nol_local  <- pol$use_nol[[1]]
+  sell_itc_local <- pol$sell_itc[[1]]
+  dep_method     <- pol$pv_dep_method[[1]]
+
+  ## AV uses 100% effective land, minus solar structure land-loss alpha
+  area_av  <- total_acres * eff_land_av_in * (1 - alpha_in)
+  base_kwh <- as.numeric(G_solar_base[[site]])
+
+  
+  ## PV cost + inverter replacement cost (cash)
+pv_cost_local <- system_kw_ac * capex_per_kw_in
+
+# NEW: fixed inverter replacement cost based on $/kW-AC
+inverter_replacement_cost_local <- inverter_replacement_cost_per_kw * system_kw_ac
+
+inverter_salvage_rate_local <- 0.10
+  ## ITC (credit amount)
+  itc_amt <- itc_rate_local * pv_cost_local
+
+  ## Depreciation basis reduction if ITC claimed/sold
+  basis <- pv_cost_local * (1 - itc_rate_local/2)
+
+  ## PV depreciation streams
+  bonus_dep_y1 <- 0
+  macrs_sched  <- rep(0, length(macrs_pv))
+
+  if (dep_method == "macrs") {
+    macrs_sched <- basis * macrs_pv
+  } else if (dep_method == "bonus100") {
+    bonus_dep_y1 <- basis
+    macrs_sched  <- rep(0, length(macrs_pv))
+  } else {
+    stop("Unknown pv_dep_method in policy_tbl.")
+  }
+
+  ## Inverter depreciation stream (5-yr MACRS starting replacement year)
+  inv_dep_stream <- rep(0, years)
+  if (inverter_replacement_year <= years) {
+    s <- inverter_replacement_year
+    for (i in seq_along(macrs_pv)) {
+      yr <- s + i - 1
+      if (yr <= years) inv_dep_stream[yr] <- inv_dep_stream[yr] + inverter_replacement_cost_local * macrs_pv[i]
+    }
+  }
+
+  ## Crop basis (Year 0 outflow)
+  s1 <- rotation$Summer[1]; w1 <- rotation$Winter[1]
+  cap_s1 <- if (s1!="Fallow") capital_investment_per_acre[[s1]] else 0
+  cap_w1 <- if (w1!="Fallow") capital_investment_per_acre[[w1]] else 0
+  ag_basis_av <- (cap_s1 + cap_w1) * area_av
+
+  ## 100% debt financing of PV
+  loan_payment_local <- (pv_cost_local * interest_rate_in) / (1 - (1 + interest_rate_in)^(-loan_term))
+  loan_balance <- pv_cost_local
+
+  rows <- vector("list", years + 1)
+
+  ## Year 0 equity CF:
+  ## - PV CapEx financed by debt => no PV equity outflow here
+  ## - Crop basis paid in cash => equity outflow
+  rows[[1]] <- tibble(
+    Year=0, Net_CF=-ag_basis_av, PV_CF=-ag_basis_av,
+    Tax=0, Taxable_Income=0, NOL_End=0, ITC_Rem=itc_amt
+  )
+
+  nol_cf <- 0
+  itc_cf <- itc_amt
+
+  lam_of <- function(crop) if (crop=="Fallow") 0 else lam_override
+  ws_of  <- function(crop) if (crop=="Fallow") 0 else water_saving_in[[crop]]  # will be 0 in this scenario
+
+  for (y in 1:years) {
+
+    s <- rotation$Summer[y]; w <- rotation$Winter[y]
+
+    ## Revenues
+    yld_s <- if (s!="Fallow") yield[[s]] else 0
+    prc_s <- if (s!="Fallow") price[[s]] else 0
+    yld_w <- if (w!="Fallow") yield[[w]] else 0
+    prc_w <- if (w!="Fallow") price[[w]] else 0
+
+    revenue_crops <- (yld_s*prc_s*area_av*(1+lam_of(s))) + (yld_w*prc_w*area_av*(1+lam_of(w)))
+    revenue_solar <- base_kwh * (1 - 0.005*(y-1)) * P_elec_in
+
+    revenue_pv_salv  <- if (y==years) salvage_rate_in * pv_cost_local else 0
+
+    salv_s1 <- if (s1!="Fallow") salvage_value_per_acre[[s1]] else 0
+    salv_w1 <- if (w1!="Fallow") salvage_value_per_acre[[w1]] else 0
+    revenue_ag_salv  <- if (y==years) (salv_s1 + salv_w1) * area_av else 0
+
+    revenue_inv_salv <- if (y==years && years >= inverter_replacement_year)
+      inverter_salvage_rate_local * inverter_replacement_cost_local else 0
+
+    ## Costs
+    cost_crops <- (if (s!="Fallow") total_cost[[s]] * area_av else 0) +
+                  (if (w!="Fallow") total_cost[[w]] * area_av else 0)
+
+    ## NO water saving => ws_of() = 0
+    cost_irrig <- (if (s!="Fallow") irrig_cost[[s]] * area_av * (1 - ws_of(s)) else 0) +
+                  (if (w!="Fallow") irrig_cost[[w]] * area_av * (1 - ws_of(w)) else 0)
+
+    cost_solar_om <- solar_om_cost_per_kw_in * system_kw_ac
+    cost_inverter_cash <- if (y==inverter_replacement_year) inverter_replacement_cost_local else 0
+
+    ## Loan schedule
+    loan_interest  <- if (y<=loan_term) loan_balance * interest_rate_in else 0
+    loan_payment_y <- if (y<=loan_term) loan_payment_local else 0
+    loan_principal <- if (y<=loan_term) loan_payment_y - loan_interest else 0
+    loan_balance   <- if (y<=loan_term) max(0, loan_balance - loan_principal) else 0
+
+    ## Depreciation
+    dep_solar_macrs    <- if (y <= length(macrs_pv)) macrs_sched[y] else 0
+    dep_solar_bonus    <- if (y == 1) bonus_dep_y1 else 0
+    dep_inverter_macrs <- inv_dep_stream[y]
+    dep_machinery      <- if (y <= length(macrs_ag)) ag_basis_av * macrs_ag[y] else 0
+
+    ## Taxable income (pre-credits, pre-NOL)
+    taxable_income_pre <- (revenue_crops + revenue_solar + revenue_pv_salv + revenue_ag_salv + revenue_inv_salv) -
+      cost_crops - cost_irrig - cost_solar_om - annual_land_rent -
+      loan_interest - dep_solar_macrs - dep_solar_bonus - dep_inverter_macrs - dep_machinery
+
+    ## NOL
+    if (isTRUE(use_nol_local)) {
+      nol_res <- apply_nol_80(taxable_income_pre, nol_cf)
+      taxable_income_post <- nol_res$TI_post
+      nol_cf <- nol_res$NOL_end
+    } else {
+      taxable_income_post <- taxable_income_pre
+      nol_cf <- 0
+    }
+
+        ## ---- Tax calculation: separate state and federal -------------------
+    ## State tax is computed first
+    state_tax_pre <- max(0, taxable_income_post * state_tax_rate)
+
+    ## Federal taxable base after deducting state tax (matches your old combined-rate logic)
+    federal_taxable_base <- taxable_income_post - state_tax_pre
+    federal_tax_pre <- max(0, federal_taxable_base * federal_tax_rate)
+
+    ## ITC handling
+    itc_cash_sale <- 0
+    itc_used <- 0
+
+    if (isTRUE(sell_itc_local)) {
+      ## Sell entire ITC in year 1 as cash; do not offset taxes directly
+      if (y == 1 && itc_cf > 0) {
+        itc_cash_sale <- itc_sale_price * itc_cf
+        itc_cf <- 0
+      }
+      federal_tax_paid <- federal_tax_pre
+      state_tax_paid   <- state_tax_pre
+
+    } else {
+      ## ITC offsets FEDERAL tax only
+      if (itc_cf > 0 && federal_tax_pre > 0) {
+        itc_used <- min(itc_cf, federal_tax_pre)
+        itc_cf   <- itc_cf - itc_used
+      }
+
+      federal_tax_paid <- max(0, federal_tax_pre - itc_used)
+      state_tax_paid   <- state_tax_pre
+    }
+
+    taxes_paid <- federal_tax_paid + state_tax_paid
+
+    ## Equity net cash flow (after tax, after debt service)
+    net_cf <- (revenue_crops + revenue_solar + revenue_pv_salv + revenue_ag_salv + revenue_inv_salv + itc_cash_sale) -
+      cost_crops - cost_irrig - cost_solar_om - annual_land_rent -
+      loan_payment_y - cost_inverter_cash - taxes_paid
+
+    ## Present value
+    pv_cf <- net_cf / (1 + discount_rate_in)^y
+
+    rows[[y+1]] <- tibble(
+      Year=y, Net_CF=net_cf, PV_CF=pv_cf,
+      Tax=taxes_paid, Taxable_Income=taxable_income_post,
+      NOL_End=nol_cf, ITC_Rem=itc_cf
+    )
+  }
+
+  bind_rows(rows) %>% mutate(Cum_NPV = cumsum(PV_CF))
+}
+```
+
+
+```{r}
+## ---- 6) AgOnly engine (policy-driven, constant 2025$; water scarcity eff area) ----
+policy_tbl_ag <- policy_tbl %>%
+  transmute(
+    Policy,
+    itc_rate      = 0.00,
+    sell_itc      = FALSE,
+    use_nol       = use_nol,
+    ag_dep_method = pv_dep_method
+  )
+
+agonly_table <- function(rotation,
+                         policy_name      = "MACRS+NOL",
+                         discount_rate_in = discount_rate,
+                         eff_land_ag_in   = eff_land_ag) {
+
+  pol <- policy_tbl_ag %>% filter(Policy == policy_name)
+  if (nrow(pol) != 1) stop("AgOnly: policy_name not found (or duplicated).")
+
+  use_nol    <- pol$use_nol[[1]]
+  dep_method <- pol$ag_dep_method[[1]]
+  tax_rate   <- combined_tax_rate
+
+  ## water scarcity: effective crop area reduced
+  area_ag <- total_acres * eff_land_ag_in
+
+  yld  <- function(c) if (c=="Fallow") 0 else unname(yield[c])
+  prc  <- function(c) if (c=="Fallow") 0 else unname(price[c])
+  oc   <- function(c) if (c=="Fallow") 0 else unname(total_cost[c])
+  ir   <- function(c) if (c=="Fallow") 0 else unname(irrig_cost[c])
+  salv <- function(c) if (c=="Fallow") 0 else unname(salvage_value_per_acre[c])
+  cap  <- function(c) if (c=="Fallow") 0 else unname(capital_investment_per_acre[c])
+
+  s1 <- rotation$Summer[1]; w1 <- rotation$Winter[1]
+  ag_basis_total <- (cap(s1) + cap(w1)) * area_ag
+  ag_salv_total  <- (salv(s1) + salv(w1)) * area_ag
+
+  nol_balance <- 0
+  rows <- vector("list", years + 1)
+
+  rows[[1]] <- tibble(
+    Year=0, Net_CF=-ag_basis_total, PV_CF=-ag_basis_total,
+    Tax=0, Taxable_Income=0, NOL_End=nol_balance
+  )
+
+  for (y in 1:years) {
+    s <- rotation$Summer[y]; w <- rotation$Winter[y]
+
+    revenue_crops <- yld(s)*prc(s)*area_ag + yld(w)*prc(w)*area_ag
+    revenue_salv  <- if (y==years) ag_salv_total else 0
+
+    cost_crops     <- oc(s)*area_ag + oc(w)*area_ag
+    cost_irrig_tot <- ir(s)*area_ag + ir(w)*area_ag  ## no water-saving here either
+
+    dep_mach <- 0
+    if (dep_method == "bonus100") {
+      dep_mach <- if (y == 1) ag_basis_total else 0
+    } else if (dep_method == "macrs") {
+      dep_mach <- if (y <= length(macrs_ag)) ag_basis_total * macrs_ag[y] else 0
+    } else {
+      stop("AgOnly: Unknown depreciation method.")
+    }
+
+    taxable_income_pre <- (revenue_crops + revenue_salv) - cost_crops - cost_irrig_tot - dep_mach
+
+    if (isTRUE(use_nol)) {
+      nol_res <- apply_nol_80(taxable_income_pre, nol_balance)
+      taxable_income_post <- nol_res$TI_post
+      nol_balance <- nol_res$NOL_end
+    } else {
+      taxable_income_post <- taxable_income_pre
+      nol_balance <- 0
+    }
+
+    taxes_paid <- max(0, taxable_income_post * tax_rate)
+
+    net_cf <- (revenue_crops + revenue_salv) - cost_crops - cost_irrig_tot - taxes_paid
+    pv_cf  <- net_cf / (1 + discount_rate_in)^y
+
+    rows[[y+1]] <- tibble(
+      Year=y, Net_CF=net_cf, PV_CF=pv_cf,
+      Tax=taxes_paid, Taxable_Income=taxable_income_post, NOL_End=nol_balance
+    )
+  }
+
+  bind_rows(rows) %>% mutate(Cum_NPV = cumsum(PV_CF))
+}
+```
+
+```{r}
+## ---- 7) Sensitivity spec (EXCLUDES water-saving; includes effective land) ----
+sens_spec_num <- tibble(
+  Param = c("Electricity price ($/kWh)","PV CapEx ($/kW-AC)","Solar O&M ($/kW-yr)",
+            "Yield change λ","Loan interest rate","Discount rate",
+            "PV salvage rate","Land-loss α"
+            ,"AV effective ag area"),
+  key   = c("P_elec","capex_per_kw","solar_om_cost_per_kw",
+            "lambda","interest_rate","discount_rate",
+            "salvage_rate","alpha","eff_land_av"),
+  low   = c(0.02, 1000, 15, -0.30, 0.03, 0.00, 0.00, 0.00, 0.50),
+  high  = c(0.11, 3000, 30,  0.03, 0.10, 0.08, 0.15, 0.50, 1.00)
+)
+```
+
+```{r}
+## ---- 8) Override runner (no globals mutated) --------------------------
+av_total_with_overrides <- function(rotation_tbl, lam_value, policy, overrides = list()) {
+
+  P_elec_l               <- P_elec
+  capex_per_kw_l         <- capex_per_kw
+  solar_om_cost_per_kw_l <- solar_om_cost_per_kw
+  interest_rate_l        <- interest_rate
+  salvage_rate_l         <- salvage_rate
+  alpha_l                <- alpha
+  discount_rate_l        <- discount_rate
+  eff_land_av_l          <- eff_land_av
+
+  for (nm in names(overrides)) {
+    if      (nm == "P_elec")             P_elec_l             <- overrides[[nm]]
+    else if (nm == "capex_per_kw")       capex_per_kw_l       <- overrides[[nm]]
+    else if (nm == "solar_om_cost_per_kw") solar_om_cost_per_kw_l <- overrides[[nm]]
+    else if (nm == "interest_rate")      interest_rate_l      <- overrides[[nm]]
+    else if (nm == "salvage_rate")       salvage_rate_l       <- overrides[[nm]]
+    else if (nm == "alpha")              alpha_l              <- overrides[[nm]]
+    else if (nm == "discount_rate")      discount_rate_l      <- overrides[[nm]]
+    else if (nm == "eff_land_av")        eff_land_av_l        <- overrides[[nm]]
+  }
+
+  av_table_policy(
+    lam_override               = lam_value,
+    rotation                   = rotation_tbl,
+    policy                     = policy,
+    site                       = site_for_plots,
+    P_elec_in                  = P_elec_l,
+    capex_per_kw_in            = capex_per_kw_l,
+    solar_om_cost_per_kw_in    = solar_om_cost_per_kw_l,
+    interest_rate_in           = interest_rate_l,
+    salvage_rate_in            = salvage_rate_l,
+    alpha_in                   = alpha_l,
+    water_saving_in            = water_saving,      # fixed at 0 in this scenario
+    discount_rate_in           = discount_rate_l,
+    eff_land_av_in             = eff_land_av_l
+  ) %>%
+    summarise(v = last(Cum_NPV)) %>% pull(v)
+}
+
+agonly_total_with_overrides <- function(rotation_tbl, policy_name, overrides = list()) {
+
+  discount_rate_l <- discount_rate
+  eff_land_ag_l   <- eff_land_ag
+
+  for (nm in names(overrides)) {
+    if      (nm == "discount_rate") discount_rate_l <- overrides[[nm]]
+    else if (nm == "eff_land_ag")   eff_land_ag_l   <- overrides[[nm]]
+  }
+
+  agonly_table(
+    rotation         = rotation_tbl,
+    policy_name      = policy_name,
+    discount_rate_in = discount_rate_l,
+    eff_land_ag_in   = eff_land_ag_l
+  ) %>%
+    summarise(v = last(Cum_NPV)) %>% pull(v)
+}
+```
+
+```{r}
+## ---- 9) Build AgOnly reference NPVs (water scarcity effective area) ---
+agonly_ref_policy <- "MACRS+NOL"
+
+agonly_cf <- tibble(
+  Rotation = c("Tomato–Garbanzo–Corn","BellPepper–Garbanzo–Corn"),
+  AgOnly_NPV = c(
+    agonly_table(rot_TGC, policy_name = agonly_ref_policy, eff_land_ag_in = eff_land_ag) %>%
+      summarise(v = last(Cum_NPV)) %>% pull(v),
+    agonly_table(rot_BGC, policy_name = agonly_ref_policy, eff_land_ag_in = eff_land_ag) %>%
+      summarise(v = last(Cum_NPV)) %>% pull(v)
+  )
+)
+
+agonly_cf
+```
+
+```{r,fig.width=16, fig.height= 9.1}
+## ---- 10) Tornado runner ----------------------------------------------
+do_one_rotation_abs <- function(rot_name, rot_tbl, lam_baseline,
+                                base_policy = "MACRS+NOL") {
+
+  base_val <- av_total_with_overrides(rot_tbl, lam_value = lam_baseline,
+                                      policy = base_policy, overrides = list())
+
+  out_num <- purrr::pmap_dfr(sens_spec_num, function(Param, key, low, high) {
+
+    if (key == "lambda") {
+      lo <- av_total_with_overrides(rot_tbl, lam_value = low,  policy = base_policy, overrides = list())
+      hi <- av_total_with_overrides(rot_tbl, lam_value = high, policy = base_policy, overrides = list())
+
+    } else if (key == "eff_land_ag") {
+      ## This impacts AgOnly, not AV; keep AV NPV unchanged for tornado bars
+      ## (If you want tornado bars to represent AV NPV only, we don't apply this to AV.)
+      lo <- base_val
+      hi <- base_val
+
+    } else if (key == "eff_land_av") {
+      lo <- av_total_with_overrides(rot_tbl, lam_value = lam_baseline, policy = base_policy,
+                                    overrides = list(eff_land_av = low))
+      hi <- av_total_with_overrides(rot_tbl, lam_value = lam_baseline, policy = base_policy,
+                                    overrides = list(eff_land_av = high))
+
+    } else {
+      lo <- av_total_with_overrides(rot_tbl, lam_value = lam_baseline, policy = base_policy,
+                                    overrides = setNames(list(low), key))
+      hi <- av_total_with_overrides(rot_tbl, lam_value = lam_baseline, policy = base_policy,
+                                    overrides = setNames(list(high), key))
+    }
+
+    tibble(Rotation = rot_name, Param, Policy = base_policy, Baseline = base_val,
+           Min = pmin(lo, hi), Max = pmax(lo, hi))
+  })
+
+  ## categorical: policy
+  pol_vals <- policy_tbl$Policy
+  pol_outcomes <- map_dbl(pol_vals, ~av_total_with_overrides(rot_tbl, lam_value = lam_baseline, policy = .x))
+  out_pol <- tibble(
+    Rotation  = rot_name,
+    Param     = "Tax policy scenario",
+    Policy    = base_policy,
+    Baseline  = base_val,
+    Min       = min(pol_outcomes, na.rm = TRUE),
+    Max       = max(pol_outcomes, na.rm = TRUE)
+  )
+
+  ## categorical: site
+  site_vals <- names(G_solar_base)
+  site_outcomes <- map_dbl(site_vals, ~{
+    av_table_policy(
+      lam_override = lam_baseline,
+      rotation     = rot_tbl,
+      policy       = base_policy,
+      site         = .x,
+      eff_land_av_in = eff_land_av
+    ) %>% summarise(v = last(Cum_NPV)) %>% pull(v)
+  })
+
+  out_site <- tibble(
+    Rotation  = rot_name,
+    Param     = "Location (site)",
+    Policy    = base_policy,
+    Baseline  = base_val,
+    Min       = min(site_outcomes, na.rm = TRUE),
+    Max       = max(site_outcomes, na.rm = TRUE)
+  )
+
+  bind_rows(out_num, out_pol, out_site)
+}
+
+base_policy_use <- "MACRS+NOL"
+
+res_abs <- bind_rows(
+  do_one_rotation_abs("Tomato–Garbanzo–Corn",     rot_TGC, lam_baseline = lam_base_TGC, base_policy = base_policy_use),
+  do_one_rotation_abs("BellPepper–Garbanzo–Corn", rot_BGC, lam_baseline = lam_base_BGC, base_policy = base_policy_use)
+) %>%
+  group_by(Rotation) %>%
+  mutate(Impact = abs(Max - Min)) %>%
+  arrange(desc(Impact), .by_group = TRUE) %>%
+  ungroup()
+
+## Reference lines: AgOnly + AV baseline
+av_base_npv <- res_abs %>%
+  group_by(Rotation) %>%
+  summarise(AV_Base_NPV = first(Baseline), .groups="drop")
+
+ref_lines <- agonly_cf %>%
+  inner_join(av_base_npv, by="Rotation") %>%
+  pivot_longer(c(AgOnly_NPV, AV_Base_NPV), names_to="Type", values_to="x") %>%
+  mutate(Type = recode(Type,
+                       AgOnly_NPV="AgOnly (reference)",
+                       AV_Base_NPV="AV baseline"))
+
+## ---- Plot: tornado heat-bar (uniform gradient) ------------------------
+abbr_map <- c(
+  "Electricity price ($/kWh)" = "Elec price",
+  "PV CapEx ($/kW-AC)"        = "PV CapEx",
+  "Solar O&M ($/kW-yr)"       = "Solar O&M",
+  "Yield change λ"            = "Yield λ",
+  "Loan interest rate"        = "Loan rate",
+  "PV salvage rate"           = "PV salvage",
+  "Land-loss α"               = "Land-loss α",
+  "Discount rate"             = "Discount rate",
+  "AgOnly effective ag area"  = "AgOnly eff area",
+  "AV effective ag area"      = "AV eff area",
+  "Tax policy scenario"       = "Policy",
+  "Location (site)"           = "Location"
+)
+
+## helper: build label text with low–high ranges
+fmt_money_small <- function(x) scales::dollar(x, accuracy = 0.01)
+fmt_money_int   <- function(x) scales::dollar(x, accuracy = 1)
+fmt_pct         <- function(x) scales::percent(x, accuracy = 0.1)
+
+range_tbl <- sens_spec_num %>%
+  mutate(
+    Param_short = recode(Param, !!!abbr_map),
+
+    range_label = case_when(
+      key == "P_elec"               ~ paste0(" (", fmt_money_small(low), " to ", fmt_money_small(high), "/kWh)"),
+      key == "capex_per_kw"         ~ paste0(" (", fmt_money_int(low), " to ", fmt_money_int(high), "/kW)"),
+      key == "solar_om_cost_per_kw" ~ paste0(" (", fmt_money_int(low), " to ", fmt_money_int(high), "/kW-yr)"),
+      key == "lambda"               ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "interest_rate"        ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "discount_rate"        ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "salvage_rate"         ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "alpha"                ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "eff_land_ag"          ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      key == "eff_land_av"          ~ paste0(" (", fmt_pct(low), " to ", fmt_pct(high), ")"),
+      TRUE ~ ""
+    ),
+
+    LegendLab = paste0(Param_short, range_label)
+  ) %>%
+  select(Param_short, LegendLab)
+
+## Add the categorical rows too (no numeric range)
+range_tbl <- bind_rows(
+  range_tbl,
+  tibble(Param_short = "Policy",   LegendLab = "Policy (all scenarios)"),
+  tibble(Param_short = "Location", LegendLab = "Location (all sites)")
+)
+
+fmt_money <- function(v) ifelse(abs(v)>=1e6, paste0("$", round(v/1e6,2), "M"),
+                                paste0("$", round(v/1e3,0), "k"))
+x_breaks <- c(-1e6, -5e5, 0, 5e5, 1e6)
+
+## Prepare plot df in stable order
+res_plot <- res_abs %>%
+  group_by(Rotation) %>%
+  arrange(desc(abs(Max - Min)), .by_group = TRUE) %>%
+  mutate(
+    Param_short = recode(Param, !!!abbr_map),
+    Param_short = factor(Param_short, levels = unique(Param_short))
+  ) %>%
+  ungroup()
+
+## Heat tiles: use higher resolution for smooth look
+n_tiles <- 1200
+
+heat_df <- res_plot %>%
+  rowwise() %>%
+  mutate(x_seq = list(seq(Min, Max, length.out = n_tiles))) %>%
+  ungroup() %>%
+  select(Rotation, Param_short, x_seq) %>%
+  tidyr::unnest(x_seq) %>%
+  rename(x = x_seq)
+
+lims <- res_plot %>%
+  group_by(Rotation) %>%
+  summarise(mx = max(abs(c(Min, Max, Baseline)), na.rm = TRUE), .groups="drop") %>%
+  left_join(ref_lines %>% group_by(Rotation) %>% summarise(mx_ref = max(abs(x)), .groups="drop"),
+            by="Rotation") %>%
+  mutate(mx_all = pmax(mx, mx_ref, na.rm=TRUE),
+         xmin = -mx_all * 1.06, xmax = mx_all * 1.06)
+
+heat_df  <- left_join(heat_df,  lims, by="Rotation")
+res_plot <- left_join(res_plot, lims, by="Rotation")
+
+## tile width per row (keeps rendering consistent)
+heat_df <- heat_df %>%
+  group_by(Rotation, Param_short) %>%
+  mutate(tile_w = (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)) / max(2, (dplyr::n() - 1))) %>%
+  ungroup()
+
+## Put AgOnly/AV labels on the top row
+top_row <- levels(res_plot$Param_short)[1]
+ref_labels_top <- ref_lines %>%
+  group_by(Rotation, Type) %>%
+  summarise(x=first(x), .groups="drop") %>%
+  mutate(
+    Param_short = top_row,
+    label = if_else(Type=="AgOnly (reference)",
+                    paste0("AgOnly: ", dollar(x)),
+                    paste0("AV base: ", dollar(x))),
+    y_nudge = if_else(Type=="AgOnly (reference)", -0.45, +0.45)
+  )
+
+first_rot <- levels(factor(res_plot$Rotation))[1]
+labels_once <- res_plot %>%
+  mutate(Rotation=factor(Rotation, levels=unique(Rotation))) %>%
+  filter(Rotation==first_rot) %>%
+  distinct(Rotation, Param_short) %>%
+  left_join(range_tbl, by="Param_short") %>%
+  left_join(lims, by="Rotation") %>%
+  mutate(
+    x_lab = xmin - 0.06*(xmax-xmin),
+    label = if_else(is.na(LegendLab), as.character(Param_short), LegendLab)
+  )
+
+p_heat <- ggplot() +
+  geom_blank(data = res_plot, aes(x = xmin, y = Param_short)) +
+  geom_blank(data = res_plot, aes(x = xmax, y = Param_short)) +
+
+  geom_tile(
+    data  = heat_df,
+    aes(x = x, y = Param_short, fill = x, width = tile_w),
+    height = 0.75,
+    inherit.aes = FALSE
+  ) +
+
+  geom_vline(xintercept = 0, linetype="dashed", color="grey40", linewidth=0.6) +
+
+  geom_vline(
+    data = ref_lines,
+    aes(xintercept = x, linetype = Type),
+    color="black", linewidth=0.9, show.legend=TRUE
+  ) +
+
+  geom_label(
+    data = ref_labels_top,
+    aes(x = x, y = Param_short, label = label),
+    size=3.1, label.size=0.25, fill="white", color="black",
+    vjust=-0.1, nudge_y = ref_labels_top$y_nudge
+  ) +
+
+  facet_wrap(~ Rotation, scales="free_x") +
+
+  scale_fill_gradient2(
+    name="Cumulative NPV ($)",
+    low="#E31A1C", mid="#FFD92F", high="#1A9850",
+    midpoint=0, labels=dollar_format(accuracy=1e5)
+  ) +
+
+  scale_linetype_manual(
+    name=NULL,
+    values=c("AgOnly (reference)"="solid", "AV baseline"="dotted")
+  ) +
+
+  scale_x_continuous(
+    breaks=x_breaks, labels=fmt_money,
+    expand=expansion(mult=c(0.06,0.08))
+  ) +
+
+  labs(
+    title = "Sensitivity of 25-year AV Net Present Value (NPV) at Water scarcity",
+    subtitle = paste0(
+      "Base policy = ", base_policy_use,
+      " | Site = ", site_for_plots,
+      " | discount rate = ", percent(discount_rate, accuracy = 0.1),
+      " | δ = 0% (no water saving)",
+" | AgOnly cropped = ", total_acres * eff_land_ag, " acres",
+" | AV cropped = ",
+total_acres * eff_land_av * (1 - alpha), " acres \n",
+      "Bars show the 25-year NPV range; lines indicate AgOnly (solid) and AV baseline (dotted)."
+    ),
+    x = "25-Year Net Present Value (NPV, constant 2025 $)",
+    y = NULL
+  ) +
+
+  theme_minimal(base_size=13) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(color="grey92"),
+    axis.text.y        = element_blank(),
+    strip.text         = element_text(face="bold", size=11),
+    legend.position    = "right",
+    legend.title       = element_text(size=10),
+    legend.text        = element_text(size=9),
+    panel.spacing.y    = unit(1.2,"lines"),
+    plot.margin        = margin(t=10,r=20,b=10,l=160)
+  ) +
+  coord_cartesian(clip="off") +
+
+  geom_text(
+    data = labels_once,
+    aes(x = x_lab, y = Param_short, label = label),
+    hjust=1, vjust=0.5, size=3.5, color="grey15",
+    inherit.aes = FALSE
+  )
+
+print(p_heat)
+```
+
+```{r}
+## ---- 11) Ranking plot -------------------------------------------------
+rank_df <- res_abs %>%
+  transmute(Rotation, Param, Impact = abs(Max - Min)) %>%
+  group_by(Rotation) %>%
+  arrange(desc(Impact), .by_group = TRUE) %>%
+  ungroup() %>%
+  mutate(Param = factor(Param, levels = rev(unique(Param))))
+
+p_rank <- ggplot(rank_df, aes(x = Param, y = Impact, fill = Impact)) +
+  geom_col(width = 0.75) +
+  facet_wrap(~ Rotation, scales = "free_y") +
+  scale_y_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M")) +
+  scale_fill_gradient2(
+    low  = "#1A9850",
+    mid  = "#FFD92F",
+    high = "#D73027",
+    midpoint = median(rank_df$Impact, na.rm = TRUE),
+    name = "Impact\n(Max − Min,\n$ million)"
+  )  +
+  labs(
+    title = "Parameter influence ranking (from tornado sensitivity)",
+    subtitle = "Impact = Max − Min of 25-year AV NPV (constant 2025$)",
+    x = NULL,
+    y = "Impact on 25-year NPV ($ million)"
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor   = element_blank(),
+        strip.text         = element_text(face = "bold", size = 10))
+
+print(p_rank)
+```
+
+```{r}
+## ---- 13) YEAR-BY-YEAR CASH FLOW TABLES (AV + AgOnly) ------------------
+if (!requireNamespace("kableExtra", quietly = TRUE)) install.packages("kableExtra")
+library(kableExtra)
+
+if (!requireNamespace("openxlsx", quietly = TRUE)) install.packages("openxlsx")
+library(openxlsx)
+
+fix_html_pipe <- function(x) gsub("&#124;", "|", x, fixed = TRUE)
+
+make_cashflow_table <- function(df, scenario_name, discount_rate_in = discount_rate) {
+
+  df2 <- df %>%
+    mutate(
+      Scenario        = fix_html_pipe(scenario_name),
+      Discount_Factor = if_else(Year == 0, 1, 1 / (1 + discount_rate_in)^Year)
+    )
+
+  required_cols <- c(
+    "Scenario","Year",
+    "Net_CF","PV_CF","Cum_NPV","Discount_Factor",
+    "Tax","Taxable_Income","NOL_End","ITC_Rem"
+  )
+
+  missing <- setdiff(required_cols, names(df2))
+  if (length(missing) > 0) {
+    df2[missing] <- NA_real_
+  }
+
+  df2 %>% select(all_of(required_cols), setdiff(names(df2), required_cols))
+}
+
+## ---- Build tables (base policy + reference) ---------------------------
+av_TGC <- av_table_policy(
+  lam_override     = lam_base_TGC,
+  rotation         = rot_TGC,
+  policy           = base_policy_use,
+  site             = site_for_plots,
+  discount_rate_in = discount_rate,
+  eff_land_av_in   = eff_land_av
+)
+
+av_BGC <- av_table_policy(
+  lam_override     = lam_base_BGC,
+  rotation         = rot_BGC,
+  policy           = base_policy_use,
+  site             = site_for_plots,
+  discount_rate_in = discount_rate,
+  eff_land_av_in   = eff_land_av
+)
+
+ag_TGC <- agonly_table(rot_TGC, policy_name = agonly_ref_policy,
+                       discount_rate_in = discount_rate, eff_land_ag_in = eff_land_ag)
+ag_BGC <- agonly_table(rot_BGC, policy_name = agonly_ref_policy,
+                       discount_rate_in = discount_rate, eff_land_ag_in = eff_land_ag)
+
+cf_TGC <- bind_rows(
+  make_cashflow_table(av_TGC, paste0("AV | ", base_policy_use, " | TGC"), discount_rate),
+  make_cashflow_table(ag_TGC, paste0("AgOnly | ", agonly_ref_policy, " | TGC"), discount_rate)
+) %>% arrange(Scenario, Year)
+
+cf_BGC <- bind_rows(
+  make_cashflow_table(av_BGC, paste0("AV | ", base_policy_use, " | BGC"), discount_rate),
+  make_cashflow_table(ag_BGC, paste0("AgOnly | ", agonly_ref_policy, " | BGC"), discount_rate)
+) %>% arrange(Scenario, Year)
+
+cf_TGC %>%
+  knitr::kable(digits = 2,
+               caption = "Year-by-year cash flow table: Tomato–Garbanzo–Corn (AV vs AgOnly) — Water scarcity") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped","condensed","bordered"),
+                            full_width = FALSE, font_size = 10) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "4.5cm")
+
+cf_BGC %>%
+  knitr::kable(digits = 2,
+               caption = "Year-by-year cash flow table: BellPepper–Garbanzo–Corn (AV vs AgOnly) — Water scarcity") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped","condensed","bordered"),
+                            full_width = FALSE, font_size = 10) %>%
+  kableExtra::column_spec(1, bold = TRUE, width = "4.5cm")
+
+out_file <- "cashflow_tables_AV_vs_AgOnly_WaterScarcity.xlsx"
+
+wb <- createWorkbook()
+addWorksheet(wb, "TGC_cashflow")
+writeDataTable(wb, "TGC_cashflow", cf_TGC, tableStyle = "TableStyleMedium9")
+
+addWorksheet(wb, "BGC_cashflow")
+writeDataTable(wb, "BGC_cashflow", cf_BGC, tableStyle = "TableStyleMedium9")
+
+money_cols <- c("Net_CF","PV_CF","Cum_NPV","Tax","Taxable_Income","NOL_End","ITC_Rem")
+df_cols    <- c("Discount_Factor")
+
+money_style <- createStyle(numFmt = "#,##0.00")
+df_style    <- createStyle(numFmt = "0.0000")
+
+for (sheet in c("TGC_cashflow","BGC_cashflow")) {
+  dat <- if (sheet == "TGC_cashflow") cf_TGC else cf_BGC
+
+  for (cn in intersect(money_cols, names(dat))) {
+    col_idx <- match(cn, names(dat))
+    addStyle(wb, sheet, money_style, cols = col_idx, rows = 2:(nrow(dat)+1),
+             gridExpand = TRUE, stack = TRUE)
+  }
+  for (cn in intersect(df_cols, names(dat))) {
+    col_idx <- match(cn, names(dat))
+    addStyle(wb, sheet, df_style, cols = col_idx, rows = 2:(nrow(dat)+1),
+             gridExpand = TRUE, stack = TRUE)
+  }
+}
+
+saveWorkbook(wb, out_file, overwrite = TRUE)
+out_file
+```
+
+```{r}
+## ---- 14) Year-by-year CUMULATIVE NPV plot (AV vs AgOnly) --------------
+plot_cum_npv <- function(av_df, ag_df, rot_label,
+                         av_label = paste0("AV | ", base_policy_use),
+                         ag_label = paste0("AgOnly | ", agonly_ref_policy)) {
+
+  df_plot <- bind_rows(
+    av_df %>% mutate(System = av_label),
+    ag_df %>% mutate(System = ag_label)
+  ) %>%
+    select(Year, System, Cum_NPV)
+
+  ggplot(df_plot, aes(x = Year, y = Cum_NPV, linetype = System)) +
+    geom_line(linewidth = 1.0) +
+    geom_point(size = 1.6) +
+    scale_y_continuous(labels = scales::dollar_format()) +
+    labs(
+      title = paste0("Year-by-year cumulative NPV (", rot_label, ") — Water scarcity"),
+      subtitle = paste0("Constant 2025$ | discount rate = ", scales::percent(discount_rate, 0.1),
+                        " | δ = 0% | AgOnly eff area = ", scales::percent(eff_land_ag, 0.1),
+                        " | AV eff area = 100% − α"),
+      x = "Year",
+      y = "Cumulative NPV (Cum_NPV)",
+      linetype = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+p_cum_TGC <- plot_cum_npv(av_TGC, ag_TGC, "Tomato–Garbanzo–Corn")
+p_cum_BGC <- plot_cum_npv(av_BGC, ag_BGC, "BellPepper–Garbanzo–Corn")
+
+print(p_cum_TGC)
+print(p_cum_BGC)
+```
+
+```{r}
+## ---- 15) Year-by-year Net CF + PV CF (optional) -----------------------
+plot_yearly_cf <- function(av_df, ag_df, rot_label,
+                           av_label = paste0("AV | ", base_policy_use),
+                           ag_label = paste0("AgOnly | ", agonly_ref_policy)) {
+
+  df_plot <- bind_rows(
+    av_df %>% mutate(System = av_label),
+    ag_df %>% mutate(System = ag_label)
+  ) %>%
+    select(Year, System, Net_CF, PV_CF) %>%
+    pivot_longer(c(Net_CF, PV_CF), names_to = "Metric", values_to = "Value") %>%
+    mutate(Metric = recode(Metric, Net_CF = "Net cash flow", PV_CF = "Present value (PV_CF)"))
+
+  ggplot(df_plot, aes(x = Year, y = Value, linetype = System)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5, color = "grey40") +
+    geom_line(linewidth = 0.9) +
+    facet_wrap(~Metric, scales = "free_y") +
+    scale_y_continuous(labels = scales::dollar_format()) +
+    labs(
+      title = paste0("Year-by-year cash flows (", rot_label, ") — Water scarcity"),
+      subtitle = "Constant 2025$ (δ = 0%: no water saving)",
+      x = "Year",
+      y = NULL,
+      linetype = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+p_cf_TGC <- plot_yearly_cf(av_TGC, ag_TGC, "Tomato–Garbanzo–Corn")
+p_cf_BGC <- plot_yearly_cf(av_BGC, ag_BGC, "BellPepper–Garbanzo–Corn")
+
+print(p_cf_TGC)
+print(p_cf_BGC)
+```
+```{r,fig.width=16, fig.height= 9.1}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ============================================================
+# Water-scarcity break-even curves (AV NPV = AgOnly NPV)
+# - AgOnly effective land = eff_land_ag (e.g., 0.80 => 8 acres)
+# - AV effective land     = eff_land_av (e.g., 1.00), then (1-alpha)
+# - δ = 0 already enforced in your AV engine via water_saving = 0
+# ============================================================
+
+# ---------------------------
+# 1) Settings (fast + stable)
+# ---------------------------
+P_search   <- seq(0.02, 0.11, length.out = 11)   # $/kWh search grid
+capex_grid <- seq(1000, 3000, length.out = 25)   # $/kW-AC grid
+disc_grid  <- c(0.03, 0.05)
+
+rotation_levels <- c("BellPepper–Garbanzo–Corn", "Tomato–Garbanzo–Corn")
+disc_levels     <- c(0.03, 0.05)
+
+# ---------------------------
+# 2) AgOnly reference NPVs by Rotation × DiscountRate
+#    IMPORTANT: include eff_land_ag_in for water scarcity
+# ---------------------------
+agonly_cf_dr <- expand_grid(
+  Rotation     = rotation_levels,
+  DiscountRate = disc_grid
+) %>%
+  mutate(
+    AgOnly_NPV = pmap_dbl(list(Rotation, DiscountRate), function(rot, dr) {
+      rot_tbl <- if (rot == "Tomato–Garbanzo–Corn") rot_TGC else rot_BGC
+
+      agonly_table(
+        rotation         = rot_tbl,
+        policy_name      = agonly_ref_policy,  # e.g., "MACRS+NOL"
+        discount_rate_in = dr,
+        eff_land_ag_in   = eff_land_ag         # <<<<<< key water-scarcity input
+      ) %>%
+        summarise(v = last(Cum_NPV)) %>% pull(v)
+    })
+  )
+
+# ---------------------------
+# 3) Delta helper (AV - AgOnly)
+#    AV uses eff_land_av internally via your AV engine
+# ---------------------------
+delta_one <- function(rot_name, rot_tbl, lam_baseline, pol, pe, ck, dr) {
+
+  av_npv <- av_total_with_overrides(
+    rotation_tbl = rot_tbl,
+    lam_value    = lam_baseline,
+    policy       = pol,
+    overrides    = list(
+      P_elec        = pe,
+      capex_per_kw  = ck,
+      discount_rate = dr,
+      eff_land_av   = eff_land_av,  # explicit for clarity (safe even if same)
+      alpha         = alpha         # explicit for clarity (safe even if same)
+    )
+  )
+
+  ag_npv <- agonly_cf_dr %>%
+    filter(Rotation == rot_name, DiscountRate == dr) %>%
+    pull(AgOnly_NPV) %>% .[1]
+
+  av_npv - ag_npv
+}
+
+# ---------------------------
+# 4) Find break-even electricity price for ONE (policy, capex, dr)
+#    Uses sign-change + linear interpolation
+# ---------------------------
+find_break_P <- function(rot_name, rot_tbl, lam_baseline, pol, ck, dr) {
+
+  deltas <- map_dbl(P_search, ~ delta_one(rot_name, rot_tbl, lam_baseline, pol, .x, ck, dr))
+
+  # No crossing in this P range
+  if (all(deltas > 0) || all(deltas < 0)) return(NA_real_)
+
+  idx <- which(deltas[-1] * deltas[-length(deltas)] <= 0)[1]
+  if (is.na(idx)) return(NA_real_)
+
+  p1 <- P_search[idx];     p2 <- P_search[idx + 1]
+  d1 <- deltas[idx];       d2 <- deltas[idx + 1]
+
+  if (d2 == d1) return(NA_real_)
+
+  # Linear interpolation for Δ = 0
+  p1 + (0 - d1) * (p2 - p1) / (d2 - d1)
+}
+
+# ---------------------------
+# 5) Build break-even curves
+# ---------------------------
+build_break_df <- function(rot_name, rot_tbl, lam_baseline) {
+  expand_grid(
+    Rotation     = rot_name,
+    DiscountRate = disc_grid,
+    Policy       = policy_tbl$Policy,
+    capex_per_kw = capex_grid
+  ) %>%
+    mutate(
+      P_elec = pmap_dbl(
+        list(Policy, capex_per_kw, DiscountRate),
+        ~ find_break_P(rot_name, rot_tbl, lam_baseline, ..1, ..2, ..3)
+      )
+    ) %>%
+    filter(!is.na(P_elec))
+}
+
+break_df <- bind_rows(
+  build_break_df("BellPepper–Garbanzo–Corn", rot_BGC, lam_base_BGC),
+  build_break_df("Tomato–Garbanzo–Corn",     rot_TGC, lam_base_TGC)
+) %>%
+  mutate(
+    Rotation     = factor(Rotation, levels = rotation_levels),
+    DiscountRate = factor(DiscountRate, levels = disc_levels),
+    Policy       = factor(Policy, levels = policy_tbl$Policy)
+  )
+
+# ---------------------------
+# 6) Legend order P1 -> P7
+# ---------------------------
+policy_code <- c(
+  "Bonus 100% (Y1 only, NO MACRS)" = "P1",
+  "MACRS"                         = "P2",
+  "Bonus 100%+NOL"                = "P3",
+  "MACRS+NOL"                     = "P4",
+  "MACRS+ITC"                     = "P5",
+  "MACRS+NOL+ITC"                 = "P6",
+  "MACRS+NOL+ITC sold Y1"         = "P7"
+)
+
+policy_order <- names(policy_code)
+
+break_df <- break_df %>%
+  mutate(Policy = factor(as.character(Policy), levels = policy_order))
+
+policy_labs_full <- setNames(
+  paste0(policy_code[policy_order], " = ", policy_order),
+  policy_order
+)
+
+policy_colors <- setNames(scales::hue_pal()(length(policy_order)), policy_order)
+
+# ---------------------------
+# 7) Plot (matches your example layout)
+# ---------------------------
+p_break_ws <- ggplot(
+  break_df,
+  aes(x = capex_per_kw, y = P_elec, color = Policy, group = Policy)
+) +
+  geom_line(linewidth = 1.15, lineend = "round") +
+  facet_grid(
+    DiscountRate ~ Rotation,
+    labeller = labeller(
+      DiscountRate = function(x)
+        paste0(percent(as.numeric(as.character(x)), accuracy = 0.1), " discount rate")
+    )
+  ) +
+  scale_color_manual(
+    values = policy_colors,
+    breaks = policy_order,
+    labels = policy_labs_full,
+    name   = "Tax policy"
+  ) +
+  scale_x_continuous(labels = dollar, breaks = pretty_breaks(5)) +
+   scale_y_continuous(
+  limits = c(0.02, NA),   # start at 0.02, let ggplot choose the top
+  labels = dollar_format(prefix = "$"),
+  breaks = seq(0.02, 0.12, by = 0.02)
+) +
+  labs(
+    title = "Break-even curves (Water scarcity): tax policy × PV CapEx × electricity price",
+    subtitle = paste0(
+      "Each curve shows where AV NPV = AgOnly NPV (Δ = 0). ",
+      "Constant 2025$ | δ = 0% | ",
+      "AgOnly cropped = ", total_acres * eff_land_ag, " acres | ",
+      "AV cropped = ", total_acres * eff_land_av * (1 - alpha), " acres (after α)"
+    ),
+    x = "PV CapEx ($/kW-AC)",
+    y = "Electricity price ($/kWh)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    strip.text    = element_text(face = "bold"),
+    panel.border  = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    legend.position = "bottom",
+    legend.box      = "horizontal",
+    legend.key.width = unit(1.6, "cm"),
+    legend.title     = element_text(size = 11),
+    legend.text      = element_text(size = 10),
+    axis.text.x      = element_text(angle = 25, hjust = 1)
+  )
+
+print(p_break_ws)
+```
+

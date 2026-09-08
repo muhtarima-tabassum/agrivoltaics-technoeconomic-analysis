@@ -1,0 +1,918 @@
+---
+title: "Untitled"
+author: "Muhtarima Tabassum"
+date: "2026-02-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,fig.width=16, fig.height= 9.1}
+## ======================================================================
+## ONE-FILE SCRIPT (UPDATED)
+## Mixed crops (2.5 acres each): AV vs AgOnly
+## ✅ Outputs represent Net Present Value (NPV) at 3% discount rate
+## ✅ Baseline policy: MACRS+NOL
+## ✅ Tornado heat-bar includes Policy + Location
+## ✅ Policy table includes MACRS / NOL / ITC / ITC-sold / Bonus100 / Bonus100+NOL
+## ======================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2)
+  library(scales); library(purrr); library(stringr); library(tibble)
+})
+
+## -----------------------------
+## 1) PARAMETERS (GLOBAL)
+## -----------------------------
+years <- 25
+total_acres <- 10
+
+# Discount rate (REAL; you are in constant dollars)
+discount_rate <- 0.03
+
+# PV sizing & costs (AC basis)
+system_kw_ac <- 818
+capex_per_kw <- 1678
+pv_cost      <- system_kw_ac * capex_per_kw
+
+
+inverter_replacement_year <- 15
+inv_salv_rate <- 0.10  # inverter salvage fraction at year T (if replaced)
+## Inverter replacement cost ($/kW-AC)
+inverter_replacement_cost_per_kw <- 70.87
+
+
+# PV economics
+P_elec               <- 0.07
+solar_om_cost_per_kw <- 23.60
+solar_om_cost        <- solar_om_cost_per_kw * system_kw_ac
+
+
+salvage_rate <- 0.10
+bonus_rate   <- 0.00   # you keep this for non-policy parts; policy handles bonus100 internally
+itc_rate     <- 0.00   # baseline in simple cashflow section (policy engine overrides this)
+
+# MACRS (PV 5-yr)
+macrs_pv <- c(0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576)
+
+# Taxes
+federal_tax_rate  <- 0.21
+state_tax_rate    <- 0.0884
+combined_tax_rate <- federal_tax_rate + state_tax_rate * (1 - federal_tax_rate)
+
+# Land and land-loss
+land_rent_per_acre <- 0
+annual_land_rent   <- land_rent_per_acre * total_acres
+alpha <- 0.10
+
+# Ag machinery MACRS (7-yr)
+macrs_ag <- c(0.1429, 0.2449, 0.1749, 0.1249, 0.0893, 0.0892, 0.0893, 0.0446)
+
+# Loan & inverter
+loan_term <- 15
+interest_rate <- 0.05
+loan_payment <- (pv_cost * interest_rate) / (1 - (1 + interest_rate)^(-loan_term))
+
+
+# Plot site
+site_for_plots <- "Davis"
+
+## Annual electricity production (kWh in Year 1) by study area
+G_solar_base <- c(
+  El_Centro   = 1987900.40,
+  Mecca       = 2017947.10,
+  Bakersfield = 1821452.40,
+  Modesto     = 1751131.00,
+  Fresno      = 1751000.00,
+  Chico       = 1762015.40,
+  Oxnard      = 1770692.40,
+  Salinas     = 1747830.00,
+  Davis       = 1783881.50
+)
+stopifnot(site_for_plots %in% names(G_solar_base))
+
+## -----------------------------
+## 2) HELPERS
+## -----------------------------
+getv <- function(vec, key, fallback = 0) {
+  v <- suppressWarnings(unname(vec[key]))
+  if (is.null(v) || is.na(v)) fallback else v
+}
+
+add_npv_cols <- function(df, r = discount_rate) {
+  df %>%
+    mutate(
+      DF       = (1 + r)^(-Year),
+      PV_NetCF = Net_CF * DF,
+      Cum_NPV  = cumsum(PV_NetCF)
+    )
+}
+
+## -----------------------------
+## 3) CROP DATA
+## -----------------------------
+capital_investment_per_acre <- c(
+  Bell_Peppers = 1179.32,  Lima_beans = 4411.36,   Corn = 4276.57,
+  Strawberry   = 21888.06,  Wheat      = 14676.43,  Spinach = 12546.07,
+  Garbanzo     = 10690.60,  Tomato     = 1473,   Lettuce_Romaine = 13720.90, Lettuce_Iceberg = 13720.90,
+  CoverCrop    = 0,         Potato     = 8664.31,   Onion  = 10305.17,
+  Broccoli     = 6132.77,
+  Raspberries_Y1 = 13807.58, Raspberries_Y2 = 0, Raspberries_Y3 = 0
+)
+
+salvage_value_per_acre <- c(
+  Bell_Peppers = 257.23,   Lima_beans = 896.44,    Corn = 744.78,
+  Strawberry   = 4116.59,   Wheat      = 6324.10,   Spinach = 4645.67,
+  Garbanzo     = 1495.27,   Tomato     = 142.54,   Lettuce_Romaine = 4728.81, Lettuce_Iceberg = 4728.81,
+  CoverCrop    = 0,         Potato     = 4492.68,   Onion  = 4602.67,
+  Broccoli     = 2580.51,
+  Raspberries_Y1 = 3946.57, Raspberries_Y2 = 0, Raspberries_Y3 = 0
+)
+
+# Lambda baseline (crop-specific)
+lambda <- c(
+  Bell_Peppers = 0,  Lima_beans = 0, Corn = 0, Strawberry = 0,
+  Wheat = 0, Spinach = 0, Garbanzo = 0, Tomato = 0,
+  Lettuce_Romaine = 0, Lettuce_Iceberg = 0, CoverCrop = 0, Potato = 0, Onion = 0, Broccoli = 0,
+  Raspberries_Y1 = 0, Raspberries_Y2 = 0, Raspberries_Y3 = 0
+)
+lambda["Tomato"]       <- -0.30
+lambda["Corn"]         <- -0.06
+lambda["Bell_Peppers"] <-  0.03
+lambda["Garbanzo"]     <-  0.01
+
+yield <- c(
+  Bell_Peppers = 30,   Lima_beans = 1.4,   Corn = 6,       Strawberry = 36,
+  Wheat = 3.5,         Spinach = 3.25,     Garbanzo = 1.2,  Tomato = 46,
+  Lettuce_Romaine = 9.35, Lettuce_Iceberg = 18.9, CoverCrop = 0,
+  Potato = 26.75, Onion = 23.25, Broccoli = 7.35,
+  Raspberries_Y1 = 10.6875, Raspberries_Y2 = 17.1, Raspberries_Y3 = 10.6875
+)
+
+price <- c(
+  Bell_Peppers = 393.58,   Lima_beans = 1585.17, Corn = 311.33,
+  Strawberry = 3620.08,    Wheat = 369.19,       Spinach = 2977.97,
+  Garbanzo = 1307.54,      Tomato = 145.20,       Lettuce_Romaine = 1056.78, Lettuce_Iceberg = 2305.89,
+  CoverCrop = 0,           Potato = 237.78,      Onion = 264.19,
+  Broccoli = 1710.98,      Raspberries_Y1 = 8923.91, Raspberries_Y2 = 8923.91, Raspberries_Y3 = 8923.91
+)
+
+total_cost <- c(
+  Bell_Peppers = 6284,  Lima_beans = 1240.76, Corn = 1437.55,
+  Strawberry = 111426.17,  Wheat = 890.09,       Spinach = 7950.65,
+  Garbanzo = 1140.64, Tomato = 4554.41, Lettuce_Romaine = 15286.32, Lettuce_Iceberg = 15689.48,
+  CoverCrop = 146.46, Potato = 3134.84, Onion = 3591.65, Broccoli=11823.25,
+  Raspberries_Y1 = 80811.93, Raspberries_Y2 = 122603.34, Raspberries_Y3 = 75900.03
+)
+
+irrig_cost <- c(
+  Bell_Peppers = 358.44, Lima_beans = 264.09, Corn = 227.41, Strawberry = 853.31,
+  Wheat = 60.41,         Spinach = 214.41,     Garbanzo = 116.91, Tomato = 289.35,
+  Lettuce_Romaine = 298.01,  Lettuce_Iceberg = 322.85, CoverCrop = 23.64,
+  Potato = 259.97, Onion = 436.11, Broccoli=459.70,
+  Raspberries_Y1 = 546.36, Raspberries_Y2 = 546.36, Raspberries_Y3 = 546.36
+)
+
+water_saving <- c(
+  Bell_Peppers = 0.08, Lima_beans = 0.08, Corn = 0.08, Strawberry = 0.08,
+  Wheat = 0.08, Spinach = 0.08, Garbanzo = 0.08, Tomato = 0.08,
+  Lettuce_Romaine = 0.08, Lettuce_Iceberg = 0.08, CoverCrop = 0.08,
+  Potato = 0.08, Onion = 0.08, Broccoli=0.08,
+  Raspberries_Y1 = 0.08, Raspberries_Y2 = 0.08, Raspberries_Y3 = 0.08
+)
+
+# Clean names + ensure Fallow exists
+for (nm in c("capital_investment_per_acre","salvage_value_per_acre",
+             "yield","price","total_cost","irrig_cost","water_saving","lambda")) {
+  x <- get(nm)
+  names(x) <- stringr::str_trim(names(x))
+  if (!("Fallow" %in% names(x))) x["Fallow"] <- 0
+  assign(nm, x)
+}
+
+## -----------------------------
+## 4) MIXED CROP SETUP
+## -----------------------------
+crops_mixed <- c("Tomato", "Garbanzo", "Corn", "Bell_Peppers")
+
+req <- crops_mixed
+for (v in c("yield","price","total_cost","irrig_cost","water_saving","lambda",
+            "capital_investment_per_acre","salvage_value_per_acre")) {
+  stopifnot(all(req %in% names(get(v))))
+}
+
+## -----------------------------
+## 5) TAX HELPERS + POLICY TABLE
+## -----------------------------
+apply_nol_80 <- function(ti_pre, nol_beg) {
+  if (ti_pre > 0) {
+    max_offset <- 0.80 * ti_pre
+    nol_used   <- min(nol_beg, max_offset)
+    ti_post    <- ti_pre - nol_used
+    nol_end    <- nol_beg - nol_used
+  } else {
+    ti_post <- ti_pre
+    nol_end <- nol_beg + (-ti_pre)
+  }
+  list(TI_post = ti_post, NOL_end = nol_end)
+}
+
+itc_sale_price <- 0.90  # if sold, cash = 0.90 * ITC amount in Year 1
+
+policy_tbl <- tibble(
+  Policy = c("MACRS",
+             "MACRS+NOL",
+             "MACRS+ITC",
+             "MACRS+NOL+ITC",
+             "MACRS+NOL+ITC sold Y1",
+             "Bonus 100% (Y1 only, NO MACRS)",
+             "Bonus 100%+NOL"),
+  itc_rate      = c(0.00, 0.00, 0.30, 0.30, 0.30, 0.00, 0.00),
+  use_nol       = c(FALSE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE),
+  sell_itc      = c(FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE),
+  pv_dep_method = c("macrs","macrs","macrs","macrs","macrs","bonus100","bonus100")
+)
+
+## -----------------------------
+## 6) CORE ENGINES (AV + AgOnly)
+## -----------------------------
+agonly_table <- function(
+  crops = crops_mixed,
+  years_in = NULL,
+  total_acres_in = NULL,
+  discount_rate_in = discount_rate
+) {
+  if (is.null(years_in))       years_in <- years
+  if (is.null(total_acres_in)) total_acres_in <- total_acres
+
+  n_crops       <- length(crops)
+  area_per_crop <- total_acres_in / n_crops
+
+  ag_basis_total <- sum(vapply(crops, function(cr) getv(capital_investment_per_acre, cr, 0) * area_per_crop, numeric(1)))
+  ag_salv_total  <- sum(vapply(crops, function(cr) getv(salvage_value_per_acre,     cr, 0) * area_per_crop, numeric(1)))
+
+  rows <- vector("list", years_in + 1)
+
+  rows[[1]] <- tibble(
+    Scenario           = "AgOnly (mixed crops)",
+    Year               = 0,
+    Area_Acres         = total_acres_in,
+    Revenue_Crops      = 0,
+    Revenue_Ag_Salvage = 0,
+    Cost_Crops         = 0,
+    Cost_Irrig         = 0,
+    Dep_Machinery      = 0,
+    Taxable_Income     = 0,
+    Taxes_Paid         = 0,
+    Net_CF             = -ag_basis_total
+  )
+
+  for (y in 1:years_in) {
+    revenue_crops <- 0
+    cost_crops    <- 0
+    cost_irrig    <- 0
+
+    for (cr in crops) {
+      revenue_crops <- revenue_crops + getv(yield, cr, 0) * getv(price, cr, 0) * area_per_crop
+      cost_crops    <- cost_crops    + getv(total_cost, cr, 0) * area_per_crop
+      cost_irrig    <- cost_irrig    + getv(irrig_cost, cr, 0) * area_per_crop
+    }
+
+    revenue_salv <- if (y == years_in) ag_salv_total else 0
+    dep_mach     <- if (y <= length(macrs_ag)) ag_basis_total * macrs_ag[y] else 0
+
+    taxable_income <- (revenue_crops + revenue_salv) - cost_crops - cost_irrig - dep_mach
+    taxes_paid <- max(0, taxable_income * combined_tax_rate)
+
+    net_cf <- (revenue_crops + revenue_salv) - cost_crops - cost_irrig - taxes_paid
+
+    rows[[y + 1]] <- tibble(
+      Scenario           = "AgOnly (mixed crops)",
+      Year               = y,
+      Area_Acres         = total_acres_in,
+      Revenue_Crops      = revenue_crops,
+      Revenue_Ag_Salvage = revenue_salv,
+      Cost_Crops         = cost_crops,
+      Cost_Irrig         = cost_irrig,
+      Dep_Machinery      = dep_mach,
+      Taxable_Income     = taxable_income,
+      Taxes_Paid         = taxes_paid,
+      Net_CF             = net_cf
+    )
+  }
+
+  df <- bind_rows(rows)
+  add_npv_cols(df, r = discount_rate_in)
+}
+
+av_table_mixed_policy <- function(
+  site = "Davis",
+  crops = crops_mixed,
+  policy = "MACRS+NOL",
+  lam_override = NA_real_,
+  years_in = NULL,
+
+  P_elec_in = P_elec,
+  capex_per_kw_in = capex_per_kw,
+  solar_om_cost_per_kw_in = solar_om_cost_per_kw,
+  interest_rate_in = interest_rate,
+  salvage_rate_in = salvage_rate,
+  alpha_in = alpha,
+  water_saving_in = water_saving,
+  discount_rate_in = discount_rate
+) {
+  if (is.null(years_in)) years_in <- years
+  stopifnot(site %in% names(G_solar_base))
+  stopifnot(policy %in% policy_tbl$Policy)
+
+  pol <- policy_tbl %>% filter(Policy == policy) %>% slice(1)
+  itc_rate_local <- pol$itc_rate
+  use_nol_local  <- pol$use_nol
+  sell_itc_local <- pol$sell_itc
+  dep_method     <- pol$pv_dep_method
+
+  base_kwh <- as.numeric(G_solar_base[[site]])
+
+  n_crops          <- length(crops)
+  area_total_av    <- total_acres * (1 - alpha_in)
+  area_per_crop_av <- area_total_av / n_crops
+
+  pv_cost_local <- system_kw_ac * capex_per_kw_in
+  # Inverter replacement cost (local): $/kW-AC * kW-AC
+inv_cost_local <- inverter_replacement_cost_per_kw * system_kw_ac
+
+  # Basis reduction for ITC
+  basis <- pv_cost_local * (1 - itc_rate_local/2)
+
+  # PV depreciation streams
+  bonus_dep_y1 <- 0
+  if (dep_method == "macrs") {
+    macrs_sched <- basis * macrs_pv
+  } else if (dep_method == "bonus100") {
+    bonus_dep_y1 <- basis
+    macrs_sched  <- rep(0, length(macrs_pv))
+  } else {
+    stop("Unknown pv_dep_method in policy_tbl.")
+  }
+
+  # Inverter depreciation stream (5-yr MACRS starting replacement year)
+  inv_dep_stream <- numeric(years_in)
+  #
+# Inverter replacement cost (local): $/kW-AC * kW-AC
+inv_cost_local <- inverter_replacement_cost_per_kw * system_kw_ac
+
+# Inverter depreciation stream (5-yr MACRS starting replacement year)
+inv_dep_stream <- numeric(years_in)
+
+if (inverter_replacement_year <= years_in) {
+  s <- inverter_replacement_year
+  for (i in seq_along(macrs_pv)) {
+    yr <- s + i - 1
+    if (yr <= years_in) {
+      inv_dep_stream[yr] <- inv_dep_stream[yr] + inv_cost_local * macrs_pv[i]
+    }
+  }
+}
+
+  # Crop basis/salvage on AV area
+  ag_basis_av <- sum(vapply(crops, function(cr) getv(capital_investment_per_acre, cr, 0) * area_per_crop_av, numeric(1)))
+  ag_salv_av  <- sum(vapply(crops, function(cr) getv(salvage_value_per_acre,     cr, 0) * area_per_crop_av, numeric(1)))
+
+  lam_of <- function(cr) {
+    if (!is.na(lam_override)) return(lam_override)
+    getv(lambda, cr, 0)
+  }
+  ws_of <- function(cr) getv(water_saving_in, cr, 0.08)
+
+  # Loan
+  loan_payment_local <- (pv_cost_local * interest_rate_in) / (1 - (1 + interest_rate_in)^(-loan_term))
+  loan_balance <- pv_cost_local
+
+  solar_om_total <- solar_om_cost_per_kw_in * system_kw_ac
+
+  # ITC + NOL state
+  itc_cf <- itc_rate_local * pv_cost_local
+  nol_cf <- 0
+
+  rows <- vector("list", years_in + 1)
+  rows[[1]] <- tibble(
+    Scenario = paste0("AV (mixed crops, ", site, ", ", policy, ")"),
+    Site     = site,
+    Policy   = policy,
+    Year     = 0,
+    Net_CF   = -ag_basis_av
+  )
+
+  for (y in 1:years_in) {
+    rev_crop <- 0; cost_crop <- 0; cost_irrig <- 0
+    for (cr in crops) {
+      rev_crop   <- rev_crop   + getv(yield, cr, 0) * getv(price, cr, 0) * area_per_crop_av * (1 + lam_of(cr))
+      cost_crop  <- cost_crop  + getv(total_cost, cr, 0) * area_per_crop_av
+      cost_irrig <- cost_irrig + getv(irrig_cost, cr, 0) * area_per_crop_av * (1 - ws_of(cr))
+    }
+
+    rev_solar    <- base_kwh * (1 - 0.005*(y-1)) * P_elec_in
+    rev_pv_salv  <- if (y == years_in) salvage_rate_in * pv_cost_local else 0
+    rev_ag_salv  <- if (y == years_in) ag_salv_av else 0
+    rev_inv_salv <- if (y == years_in && years_in >= inverter_replacement_year) inv_salv_rate * inv_cost_local else 0
+
+    inv_cash <- if (y == inverter_replacement_year) inv_cost_local else 0
+
+    loan_interest  <- if (y <= loan_term) loan_balance * interest_rate_in else 0
+    loan_payment_y <- if (y <= loan_term) loan_payment_local else 0
+    loan_principal <- if (y <= loan_term) loan_payment_y - loan_interest else 0
+    loan_balance   <- if (y <= loan_term) loan_balance - loan_principal else loan_balance
+    if (abs(loan_balance) < 1e-6) loan_balance <- 0
+
+    dep_solar <- if (y <= length(macrs_sched)) macrs_sched[y] else 0
+    dep_inv   <- inv_dep_stream[y]
+    dep_mach  <- if (y <= length(macrs_ag)) ag_basis_av * macrs_ag[y] else 0
+    dep_bonus <- if (y == 1) bonus_dep_y1 else 0
+
+    ti_pre <- (rev_crop + rev_solar + rev_pv_salv + rev_ag_salv + rev_inv_salv) -
+      cost_crop - cost_irrig - solar_om_total - annual_land_rent -
+      loan_interest - dep_solar - dep_inv - dep_mach - dep_bonus
+
+    # NOL (80% limit)
+    if (isTRUE(use_nol_local)) {
+      nol_res <- apply_nol_80(ti_pre, nol_cf)
+      ti_post <- nol_res$TI_post
+      nol_cf  <- nol_res$NOL_end
+    } else {
+      ti_post <- ti_pre
+      nol_cf  <- 0
+    }
+
+    taxes_pre_credit <- max(0, ti_post * combined_tax_rate)
+
+    itc_cash_sale <- 0
+    itc_used <- 0
+    if (isTRUE(sell_itc_local)) {
+      if (y == 1 && itc_cf > 0) {
+        itc_cash_sale <- itc_sale_price * itc_cf
+        itc_cf <- 0
+      }
+      taxes_paid <- taxes_pre_credit
+    } else {
+      if (itc_cf > 0 && taxes_pre_credit > 0) {
+        itc_used <- min(itc_cf, taxes_pre_credit)
+        itc_cf <- itc_cf - itc_used
+      }
+      taxes_paid <- max(0, taxes_pre_credit - itc_used)
+    }
+
+    net_cf <- (rev_crop + rev_solar + rev_pv_salv + rev_ag_salv + rev_inv_salv + itc_cash_sale) -
+      cost_crop - cost_irrig - solar_om_total - annual_land_rent -
+      loan_payment_y - inv_cash - taxes_paid
+
+    rows[[y + 1]] <- tibble(
+      Scenario = paste0("AV (mixed crops, ", site, ", ", policy, ")"),
+      Site     = site,
+      Policy   = policy,
+      Year     = y,
+      Net_CF   = net_cf
+    )
+  }
+
+  df <- bind_rows(rows)
+  add_npv_cols(df, r = discount_rate_in)
+}
+
+## -----------------------------
+## 7) BUILD TABLES (AV + AgOnly)
+## -----------------------------
+base_policy <- "MACRS+NOL"
+base_site   <- site_for_plots
+
+av_tbl <- av_table_mixed_policy(
+  site   = base_site,
+  crops  = crops_mixed,
+  policy = base_policy
+)
+
+df_agonly <- agonly_table(
+  crops = crops_mixed
+)
+
+# Quick check
+print(av_tbl %>% summarise(NPV_25yr = last(Cum_NPV)))
+print(df_agonly %>% summarise(NPV_25yr = last(Cum_NPV)))
+```
+
+
+```{r,fig.width=16, fig.height= 9.1}
+## =========================================================
+## 8) TORNADO HEAT-BAR (NPV @ 3%)  — Mixed crops
+## Includes:
+##  - Discount rate sensitivity (0–7%)
+##  - MACRS+NOL baseline policy
+##  - Left-side labels include tested ranges
+##  - Fix NA parameter label
+##  - Electricity price bar is smooth (no stripes)
+##  - Clean white background (no grey grid)
+## =========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2)
+  library(scales); library(purrr); library(stringr); library(tibble)
+})
+
+## ---- Baseline choices (edit if needed) ----
+scenario_name <- "Mixed crops (Tomato + Garbanzo + Corn + Bell peppers)"
+base_policy   <- "MACRS+NOL"
+base_site     <- site_for_plots   # uses your earlier site_for_plots
+# baseline discount rate must already exist in your script:
+# discount_rate <- 0.03
+
+## ---- Sensitivity specification (numeric parameters + discount rate) ----
+sens_spec_num <- tibble(
+  Param = c("Electricity price ($/kWh)","PV CapEx ($/kW-AC)","Solar O&M ($/kW-yr)",
+            "Yield change λ (uniform override)","Loan interest rate","PV salvage rate",
+            "Land-loss α","Water-saving factor","Discount rate (NPV)"),
+  key   = c("P_elec","capex_per_kw","solar_om_cost_per_kw",
+            "lambda_override","interest_rate","salvage_rate","alpha","water_saving_pct","discount_rate"),
+  low   = c(0.02, 1000, 15, -0.30, 0.03, 0.00, 0.00, 0.00, 0.00),
+  high  = c(0.11, 3000, 30,  0.30, 0.10, 0.15, 0.50, 0.25, 0.08)
+)
+
+## ---- Abbreviations (MUST match Param strings exactly) ----
+abbr_map <- c(
+  "Electricity price ($/kWh)"         = "Elec price",
+  "PV CapEx ($/kW-AC)"                = "PV CapEx",
+  "Solar O&M ($/kW-yr)"               = "Solar O&M",
+  "Yield change λ (uniform override)" = "Yield λ",
+  "Loan interest rate"                = "Loan rate",
+  "PV salvage rate"                   = "PV salvage",
+  "Land-loss α"                       = "Land-loss α",
+  "Water-saving factor"               = "Water saving",
+  "Discount rate (NPV)"               = "Discount rate",
+  "Tax policy scenario"               = "Policy",
+  "Location (site)"                   = "Location"
+)
+
+legend_tbl <- tibble(
+  Param_short = c("Elec price","PV CapEx","Solar O&M","Yield λ","Loan rate","PV salvage",
+                  "Land-loss α","Water saving","Discount rate","Policy","Location"),
+  LegendLab   = c("Electricity price",
+                  "PV CapEx",
+                  "Solar O&M",
+                  "Yield change (λ)",
+                  "Loan interest rate",
+                  "PV salvage rate",
+                  "Land-loss (α)",
+                  "Water-saving factor",
+                  "Discount rate",
+                  "Tax policy scenario",
+                  "Solar irradiance site")
+)
+
+## ---- Formatting helpers ----
+fmt_money <- function(v) ifelse(abs(v) >= 1e6,
+                               paste0("$", round(v/1e6, 2), "M"),
+                               paste0("$", round(v/1e3, 0), "k"))
+fmt_money2 <- function(v) scales::dollar(v, accuracy = 1)
+fmt_pct    <- function(x) paste0(round(100*x, 1), "%")
+fmt_rate   <- function(x) paste0(round(100*x, 1), "%")
+
+## ---- Wrapper: return 25-year NPV for AV mixed crops under overrides ----
+av_total_mixed_npv <- function(policy = base_policy, site = base_site, overrides = list()) {
+
+  # start from your script's baseline globals
+  P_elec_l <- P_elec
+  capex_l  <- capex_per_kw
+  om_l     <- solar_om_cost_per_kw
+  r_l      <- interest_rate
+  salv_l   <- salvage_rate
+  alpha_l  <- alpha
+  ws_l     <- water_saving
+  lam_ov   <- NA_real_
+  disc_l   <- discount_rate
+
+  for (nm in names(overrides)) {
+    if (nm == "water_saving_pct") {
+      ws_val <- overrides[[nm]]
+      ws_l <- setNames(rep(ws_val, length(ws_l)), names(ws_l))
+      ws_l <- pmin(pmax(ws_l, 0), 0.90)
+    } else if (nm == "lambda_override") {
+      lam_ov <- overrides[[nm]]
+    } else if (nm == "discount_rate") {
+      disc_l <- overrides[[nm]]
+    } else if (nm == "P_elec") P_elec_l <- overrides[[nm]]
+    else if (nm == "capex_per_kw") capex_l <- overrides[[nm]]
+    else if (nm == "solar_om_cost_per_kw") om_l <- overrides[[nm]]
+    else if (nm == "interest_rate") r_l <- overrides[[nm]]
+    else if (nm == "salvage_rate") salv_l <- overrides[[nm]]
+    else if (nm == "alpha") alpha_l <- overrides[[nm]]
+  }
+
+  av_table_mixed_policy(
+    site = site,
+    crops = crops_mixed,
+    policy = policy,
+    lam_override = lam_ov,
+    P_elec_in = P_elec_l,
+    capex_per_kw_in = capex_l,
+    solar_om_cost_per_kw_in = om_l,
+    interest_rate_in = r_l,
+    salvage_rate_in = salv_l,
+    alpha_in = alpha_l,
+    water_saving_in = ws_l,
+    discount_rate_in = disc_l
+  ) %>%
+    summarise(v = last(Cum_NPV)) %>%
+    pull(v)
+}
+
+## ---- Baseline and sensitivity results ----
+base_val <- av_total_mixed_npv(policy = base_policy, site = base_site)
+
+out_num <- purrr::pmap_dfr(sens_spec_num, function(Param, key, low, high) {
+
+  lo <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                           overrides = setNames(list(low), key))
+  hi <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                           overrides = setNames(list(high), key))
+
+  # special handling (keeps your original logic explicit)
+  if (key == "lambda_override") {
+    lo <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(lambda_override = low))
+    hi <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(lambda_override = high))
+  }
+  if (key == "water_saving_pct") {
+    lo <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(water_saving_pct = low))
+    hi <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(water_saving_pct = high))
+  }
+  if (key == "discount_rate") {
+    lo <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(discount_rate = low))
+    hi <- av_total_mixed_npv(policy = base_policy, site = base_site,
+                             overrides = list(discount_rate = high))
+  }
+
+  tibble(
+    Scenario = scenario_name,
+    Param    = Param,
+    Baseline = base_val,
+    Min      = pmin(lo, hi),
+    Max      = pmax(lo, hi)
+  )
+})
+
+# categorical: policy
+pol_vals <- policy_tbl$Policy
+pol_outcomes <- map_dbl(pol_vals, ~av_total_mixed_npv(policy = .x, site = base_site))
+out_pol <- tibble(
+  Scenario = scenario_name,
+  Param    = "Tax policy scenario",
+  Baseline = base_val,
+  Min      = min(pol_outcomes, na.rm = TRUE),
+  Max      = max(pol_outcomes, na.rm = TRUE)
+)
+
+# categorical: site
+site_vals <- names(G_solar_base)
+site_outcomes <- map_dbl(site_vals, ~av_total_mixed_npv(policy = base_policy, site = .x))
+out_site <- tibble(
+  Scenario = scenario_name,
+  Param    = "Location (site)",
+  Baseline = base_val,
+  Min      = min(site_outcomes, na.rm = TRUE),
+  Max      = max(site_outcomes, na.rm = TRUE)
+)
+
+res_abs <- bind_rows(out_num, out_pol, out_site) %>%
+  mutate(Impact = abs(Max - Min)) %>%
+  arrange(desc(Impact))
+
+## ---- Reference lines: AgOnly NPV + AV baseline NPV ----
+agonly_npv_val <- agonly_table(crops = crops_mixed, discount_rate_in = discount_rate) %>%
+  summarise(v = last(Cum_NPV)) %>% pull(v)
+
+ref_lines <- tibble(
+  Scenario = scenario_name,
+  Type = c("AgOnly (reference NPV)", "AV baseline NPV"),
+  x    = c(agonly_npv_val, base_val)
+)
+
+## ---- Plot prep (no NA labels) ----
+res_plot <- res_abs %>%
+  mutate(
+    Param_short = recode(Param, !!!abbr_map),
+    Param_short = if_else(is.na(Param_short), Param, Param_short)  # safety: never NA
+  ) %>%
+  mutate(Param_short = factor(Param_short, levels = unique(Param_short)))
+
+## ---- Heat tiles data (smooth bars, especially electricity) ----
+n_tiles <- 900
+heat_df <- res_plot %>%
+  rowwise() %>%
+  mutate(x_seq = list(seq(Min, Max, length.out = n_tiles))) %>%
+  ungroup() %>%
+  select(Scenario, Param_short, x_seq) %>%
+  unnest(x_seq) %>%
+  rename(x = x_seq)
+
+## ---- x-limits & breaks ----
+lims <- res_plot %>%
+  summarise(mx = max(abs(c(Min, Max, Baseline)), na.rm = TRUE)) %>%
+  mutate(mx_all = pmax(mx, max(abs(ref_lines$x)), na.rm = TRUE),
+         xmin = -mx_all * 1.06, xmax = mx_all * 1.06)
+
+x_breaks <- pretty(c(lims$xmin, lims$xmax), n = 5)
+
+## ---- Range strings for left-side labels ----
+range_tbl <- sens_spec_num %>%
+  mutate(Param_short = recode(Param, !!!abbr_map)) %>%
+  mutate(range_txt = dplyr::case_when(
+    key == "P_elec"               ~ paste0("$", sprintf("%.2f", low), " to $", sprintf("%.2f", high), " /kWh"),
+    key == "capex_per_kw"         ~ paste0(fmt_money2(low), " to ", fmt_money2(high), " /kW-AC"),
+    key == "solar_om_cost_per_kw" ~ paste0(fmt_money2(low), " to ", fmt_money2(high), " /kW-yr"),
+    key == "lambda_override"      ~ paste0(fmt_pct(low), " to ", fmt_pct(high)),
+    key == "interest_rate"        ~ paste0(fmt_rate(low), " to ", fmt_rate(high)),
+    key == "salvage_rate"         ~ paste0(fmt_pct(low), " to ", fmt_pct(high)),
+    key == "alpha"                ~ paste0(fmt_pct(low), " to ", fmt_pct(high)),
+    key == "water_saving_pct"     ~ paste0(fmt_pct(low), " to ", fmt_pct(high)),
+    key == "discount_rate"        ~ paste0(fmt_rate(low), " to ", fmt_rate(high)),
+    TRUE ~ ""
+  )) %>%
+  select(Param_short, range_txt)
+
+labels_once <- res_plot %>%
+  distinct(Scenario, Param_short) %>%
+  left_join(legend_tbl, by = "Param_short") %>%
+  left_join(range_tbl,  by = "Param_short") %>%
+  mutate(
+    label = if_else(
+      Param_short %in% c("Policy","Location"),
+      LegendLab,
+      paste0(LegendLab, " (", range_txt, ")")
+    ),
+    x_lab = lims$xmin - 0.06*(lims$xmax - lims$xmin)
+  )
+
+## ---- Label reference lines on top row ----
+top_row <- levels(res_plot$Param_short)[1]
+ref_labels_top <- ref_lines %>%
+  mutate(
+    Param_short = top_row,
+    label = if_else(Type == "AgOnly (reference NPV)",
+                    paste0("AgOnly NPV: ", scales::dollar(x)),
+                    paste0("AV base NPV: ", scales::dollar(x))),
+    y_nudge = if_else(Type == "AgOnly (reference NPV)", -0.45, +0.45)
+  )
+
+## ---- Subtitle pieces (optional) ----
+alpha_label2 <- scales::percent(alpha, accuracy = 1)
+delta_label2 <- scales::percent(0.08, accuracy = 1)
+lambda_label2 <- "λ baseline:\nTomato - 30%, Corn - 6%, Garbanzo +1%, Bell Pepper +3%"
+
+## ---- Plot ----
+p_heat <- ggplot() +
+  geom_blank(data = heat_df, aes(x = lims$xmin, y = Param_short)) +
+  geom_blank(data = heat_df, aes(x = lims$xmax, y = Param_short)) +
+
+  geom_tile(
+    data  = heat_df,
+    aes(x = x, y = Param_short, fill = x),
+    height = 0.75,
+    width  = (lims$xmax - lims$xmin) / n_tiles   # smooth / consistent
+  ) +
+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.6) +
+
+  geom_vline(
+    data = ref_lines,
+    aes(xintercept = x, linetype = Type),
+    color = "black", linewidth = 0.9, show.legend = TRUE
+  ) +
+
+  geom_label(
+    data = ref_labels_top,
+    aes(x = x, y = Param_short, label = label),
+    size = 3.1, label.size = 0.65, fill = "white", color = "black",
+    vjust = -0.1, nudge_y = ref_labels_top$y_nudge
+  ) +
+
+  facet_wrap(~ Scenario, scales = "free_x") +
+
+  scale_fill_gradient2(
+    name = "NPV ($)",
+    low = "#E31A1C", mid = "#FFD92F", high = "#1A9850",
+    midpoint = 0, labels = scales::dollar_format(accuracy = 1e5)
+  ) +
+
+  scale_linetype_manual(
+    name = NULL,
+    values = c("AgOnly (reference NPV)" = "solid", "AV baseline NPV" = "dotted")
+  ) +
+
+  scale_x_continuous(
+    breaks = x_breaks,
+    labels = fmt_money,
+    expand = expansion(mult = c(0.06, 0.08))
+  ) +
+
+  labs(
+    title = "Sensitivity of 25-year AV Net Present Value (NPV) (mixed crops)",
+    subtitle = paste0(
+      
+      " Base Policy = ", base_policy,
+      " |discount rate r = ", scales::percent(discount_rate, accuracy = 0.1), " | Site = ", base_site, " | α = ", alpha_label2, " | δ = ", delta_label2, " | ", lambda_label2,
+      "\nBars show the 25-year NPV range"
+    ),
+    x = "25-Year Net Present Value (NPV, constant 2025 $)",
+    y = NULL
+  ) +
+
+  theme_minimal(base_size = 16) +
+  theme(
+  panel.grid = element_blank(),
+  panel.background = element_rect(fill = "white", colour = NA),
+  plot.background  = element_rect(fill = "white", colour = NA),
+
+  axis.text.y = element_blank(),
+  strip.text = element_text(face = "bold", size = 14),
+
+  plot.title = element_text(
+    face = "bold",
+    size = 18,
+    hjust = 0.5
+  ),
+
+  legend.position = "right",
+  legend.title = element_text(size = 13),
+  legend.text  = element_text(size = 12),
+
+  panel.spacing.y = unit(1.2,"lines"),
+  plot.margin     = margin(t = 10, r = 20, b = 10, l = 160)
+)+
+ coord_cartesian(clip = "off") +
+
+  geom_text(
+    data = labels_once,
+    aes(x = x_lab, y = Param_short, label = label),
+    hjust = 1, vjust = 0.5, size = 4.3, color = "grey15",
+    inherit.aes = FALSE
+  )
+
+print(p_heat)
+
+## -----------------------------
+## 9) Optional: Ranking plot (NPV impact)
+## -----------------------------
+rank_df <- res_abs %>%
+  mutate(
+    Param_short = recode(Param, !!!abbr_map),
+    Param_short = if_else(is.na(Param_short), Param, Param_short),
+    Param_short = factor(Param_short, levels = rev(unique(Param_short)))
+  )
+
+p_rank <- ggplot(rank_df, aes(x = Impact, y = Param_short, fill = Impact)) +
+  geom_col(width = 0.75) +
+  scale_x_continuous(
+    labels = scales::dollar_format(scale = 1e-6, suffix = "M"),
+    guide  = guide_axis(angle = 30)
+  ) +
+  scale_fill_gradient2(
+    low  = "#1A9850", mid  = "#FFD92F", high = "#D73027",
+    midpoint = median(rank_df$Impact, na.rm = TRUE),
+    name = "Impact\n(Max - Min,\n$ million)"
+  ) +
+  labs(
+    title = "Parameter influence ranking (from tornado sensitivity)",
+    subtitle = paste0(
+  "r = ", scales::percent(discount_rate, accuracy = 0.1),
+  " | ", base_policy, " | ", base_site,
+  " | α=", alpha_label2, ", δ=", delta_label2,
+  "\nBars = NPV range; lines = AgOnly (solid) & AV base (dotted)."
+),
+    x = "Impact on 25-year NPV ($ million)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(size = 14, face = "bold")
+  )
+
+print(p_rank)
+
+ggsave(
+  filename = "C:/MS_Thesis/Paper_manuscript/Dr_majdis_feedback/Fig_2.5_Tornado_NPV.png",
+  plot = p_heat,
+  width = 16,
+  height = 10,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
